@@ -1,0 +1,42 @@
+# Database
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Logs
+logs/
+*.log
+
+# ML artefacts — keep model.pkl tracked
+# (remove next line if you want to exclude the model too)
+# ml/model.pkl
+
+# Reports (generated on demand)
+reports/*.pdf
+reports/*.html
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
+
+# IDE
+.vscode/
+.idea/

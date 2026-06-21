@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+sqlalchemy
+streamlit
+scikit-learn
+pandas
+numpy
+folium
+streamlit-folium
+jinja2
+weasyprint
+matplotlib
+plotly
+python-dotenv
