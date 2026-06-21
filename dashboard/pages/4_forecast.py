@@ -5,7 +5,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import io
-import pickle
 import csv
 import streamlit as st
 import pandas as pd
@@ -13,66 +12,214 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import date, timedelta
 
-from dashboard.utils import show_banner, show_footer, get_session, REGIONS
-from backend.models import HarvestRecord, Paddock, Grower, Contract
-from ml.features import WEATHER, single_row, VARIETY_MAP, SOIL_MAP, REGION_MAP
+from dashboard.utils import show_banner, show_footer, get_session
+from backend.models import (
+    HarvestRecord, SowingRecord, Paddock, Grower, Contract,
+)
+from ml.features import (
+    WEATHER, single_row, VARIETY_MAP, SOIL_MAP, REGION_MAP,
+    build_features, FEATURE_COLS,
+)
 
 st.set_page_config(page_title="Forecast – AgroCMS", layout="wide")
 show_banner()
 st.title("Yield Forecast")
 
-MODEL_PATH = Path(__file__).parent.parent.parent / "ml" / "model.pkl"
-
-# Historical input ranges from training data
 HIST_RANGES = {
-    "rainfall_mm":    (555, 740),
-    "avg_temp_c":     (11.5, 14.1),
-    "seed_rate_kg_ha":(1.2, 1.8),
-    "area_ha":        (15.0, 75.0),
+    "rainfall_mm":     (555, 740),
+    "avg_temp_c":      (11.5, 14.1),
+    "seed_rate_kg_ha": (1.2, 1.8),
+    "area_ha":         (15.0, 75.0),
 }
 
+SEASON_YEAR = {"2022-23": 2022, "2023-24": 2023, "2024-25": 2024}
 
-@st.cache_resource
-def load_model():
-    if not MODEL_PATH.exists():
-        return None
-    with open(MODEL_PATH, "rb") as f:
-        return pickle.load(f)
-
-
-model_data = load_model()
-
-if model_data is None:
-    st.error("Model not found. Run `python ml/train.py` to train the model first.", icon="⚠️")
-    st.stop()
-
-model  = model_data["model"]
-rmse   = model_data.get("val_rmse") or model_data.get("train_rmse", 0.6)
-feat_imp = model_data.get("feature_importances", {})
-
-# Pretty feature labels
 FEAT_LABELS = {
-    "soil_type_enc":       "Soil type",
-    "variety_enc":         "Crop variety",
-    "rainfall_mm":         "Seasonal rainfall",
-    "area_ha":             "Paddock area",
-    "sow_date_dayofyear":  "Sowing date",
-    "seed_deviation":      "Seed rate (deviation from optimal)",
-    "region_enc":          "Region",
-    "temp_deviation":      "Temperature (deviation from optimal)",
-    "season_year":         "Season year",
+    "soil_type_enc":      "Soil type",
+    "variety_enc":        "Crop variety",
+    "rainfall_mm":        "Seasonal rainfall",
+    "area_ha":            "Paddock area",
+    "sow_date_dayofyear": "Sowing date",
+    "seed_deviation":     "Seed rate deviation from optimal",
+    "region_enc":         "Region",
+    "temp_deviation":     "Temperature deviation from optimal",
+    "season_year":        "Season year",
 }
 
-st.success(
-    f"Model: HistGradientBoostingRegressor | "
-    f"Train R²: {model_data['train_r2']:.3f} | "
-    f"Val R²: {model_data.get('val_r2', 'N/A'):.3f} | "
-    f"Val RMSE: {rmse:.3f} kg/ha | "
-    f"Trained: {model_data.get('trained_on', 'unknown')}",
-    icon="✅",
-)
+
+# ── Runtime model training (cached across all sessions) ───────────────────────
+@st.cache_resource(show_spinner=False)
+def build_model():
+    """
+    Train HistGradientBoostingRegressor at runtime from the synthetic DB.
+    Avoids pickle compatibility issues across numpy/scikit-learn versions.
+    Returns None on any failure so the page falls back gracefully.
+    """
+    try:
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        from sklearn.inspection import permutation_importance
+        from sklearn.metrics import r2_score
+        from datetime import date as _date
+
+        # Compatibility shim: root_mean_squared_error added in sklearn 1.4
+        try:
+            from sklearn.metrics import root_mean_squared_error as _rmse
+        except ImportError:
+            import numpy as _np
+            from sklearn.metrics import mean_squared_error as _mse
+            def _rmse(y_true, y_pred):
+                return float(_np.sqrt(_mse(y_true, y_pred)))
+
+        # Query DB for harvest records with matching sowing and paddock data
+        sess = get_session()
+        try:
+            rows = []
+            for hr in sess.query(HarvestRecord).all():
+                if hr.yield_kg_ha is None:
+                    continue
+                sow = (
+                    sess.query(SowingRecord)
+                    .filter(
+                        SowingRecord.paddock_id  == hr.paddock_id,
+                        SowingRecord.contract_id == hr.contract_id,
+                    )
+                    .first()
+                )
+                if sow is None:
+                    continue
+                pad      = sess.get(Paddock,  hr.paddock_id)
+                contract = sess.get(Contract, hr.contract_id)
+                grower   = sess.get(Grower,   pad.grower_id)
+                yr       = SEASON_YEAR.get(contract.season)
+                if yr is None:
+                    continue
+                weather = WEATHER.get((grower.region, yr), {})
+                rows.append({
+                    "variety":         contract.variety,
+                    "soil_type":       pad.soil_type,
+                    "area_ha":         pad.area_ha,
+                    "sow_date":        sow.sow_date,
+                    "rainfall_mm":     weather.get("rainfall_mm", 620),
+                    "avg_temp_c":      weather.get("avg_temp_c", 12.5),
+                    "seed_rate_kg_ha": sow.seed_rate_kg_ha or 1.5,
+                    "region":          grower.region,
+                    "season_year":     yr,
+                    "season":          contract.season,
+                    "yield_kg_ha":     hr.yield_kg_ha,
+                })
+        finally:
+            sess.close()
+
+        df = pd.DataFrame(rows)
+        if df.empty or len(df) < 10:
+            return None
+
+        train_df = df[df["season"].isin(["2022-23", "2023-24"])].copy()
+        val_df   = df[df["season"] == "2024-25"].copy()
+
+        X_train  = build_features(train_df)
+        y_train  = train_df["yield_kg_ha"].values
+
+        model = HistGradientBoostingRegressor(
+            max_iter=200,
+            max_depth=4,
+            learning_rate=0.05,
+            random_state=42,
+            min_samples_leaf=8,
+            monotonic_cst={
+                "rainfall_mm":    1,
+                "temp_deviation": -1,
+                "seed_deviation": -1,
+            },
+        )
+        model.fit(X_train, y_train)
+
+        train_r2   = r2_score(y_train, model.predict(X_train))
+        train_rmse = _rmse(y_train, model.predict(X_train))
+
+        val_r2, val_rmse = None, train_rmse
+        if not val_df.empty:
+            X_val   = build_features(val_df)
+            y_val   = val_df["yield_kg_ha"].values
+            val_r2  = r2_score(y_val,  model.predict(X_val))
+            val_rmse = _rmse(y_val, model.predict(X_val))
+
+        try:
+            perm = permutation_importance(
+                model, X_train, y_train, n_repeats=10, random_state=42
+            )
+            importances = dict(zip(FEATURE_COLS, perm.importances_mean))
+        except Exception:
+            importances = {}
+
+        return {
+            "model":               model,
+            "train_r2":            train_r2,
+            "val_r2":              val_r2,
+            "train_rmse":          train_rmse,
+            "val_rmse":            val_rmse,
+            "feature_importances": importances,
+            "trained_on":          str(_date.today()),
+        }
+
+    except Exception:
+        return None
+
+
+# ── Deterministic fallback (no sklearn dependency) ────────────────────────────
+def _fallback_predict(variety, soil_type, rainfall_mm, avg_temp_c, seed_rate_kg_ha):
+    """
+    Simple formula matching the synthetic data generator.
+    Used only when runtime model training fails.
+    """
+    base     = {"Norman": 10.5, "Latex": 9.8}.get(variety, 10.0)
+    soil_mod = {"Red Ferrosol": 0.8, "Brown Dermosol": 0.0, "Grey Vertosol": -0.5}.get(soil_type, 0.0)
+    rain_mod = (rainfall_mm - 650) * 0.003
+    temp_mod = -abs(avg_temp_c - 12.0) * 0.08
+    seed_mod = -abs(seed_rate_kg_ha - 1.5) * 0.5
+    return min(14.0, max(8.0, base + soil_mod + rain_mod + temp_mod + seed_mod))
+
+
+def predict_yield(variety, soil_type, region, area_ha, sow_date,
+                  rainfall_mm, avg_temp_c, seed_rate_kg_ha, season_year, model_data):
+    if model_data is not None:
+        X = single_row(variety, soil_type, region, area_ha, sow_date,
+                       rainfall_mm, avg_temp_c, seed_rate_kg_ha, season_year)
+        return float(model_data["model"].predict(X)[0])
+    return _fallback_predict(variety, soil_type, rainfall_mm, avg_temp_c, seed_rate_kg_ha)
+
+
+# ── Build/load model ──────────────────────────────────────────────────────────
+with st.spinner("Building forecast model from synthetic data..."):
+    model_data = build_model()
+
+if model_data is not None:
+    rmse     = model_data.get("val_rmse") or model_data.get("train_rmse", 0.6)
+    feat_imp = model_data.get("feature_importances", {})
+    val_r2_str = (
+        f"{model_data['val_r2']:.3f}"
+        if model_data.get("val_r2") is not None else "N/A"
+    )
+    st.success(
+        f"Model: HistGradientBoostingRegressor  |  "
+        f"Train R2: {model_data['train_r2']:.3f}  |  "
+        f"Val R2: {val_r2_str}  |  "
+        f"Val RMSE: {rmse:.3f} kg/ha  |  "
+        f"Trained: {model_data.get('trained_on', 'today')}",
+        icon="✅",
+    )
+else:
+    rmse     = 0.6
+    feat_imp = {}
+    st.info(
+        "ML model training unavailable in this environment. "
+        "Showing a deterministic formula-based forecast. "
+        "Results match the same synthetic data relationships and remain illustrative.",
+        icon="ℹ️",
+    )
+
 st.caption(
-    "⚠️ This is an illustrative ML model trained on synthetically generated data. "
+    "Illustrative synthetic model trained on algorithmically generated data. "
     "Predictions should not be used for real-world agronomic decisions."
 )
 st.divider()
@@ -86,8 +233,9 @@ with left:
         variety   = st.selectbox("Variety",   list(VARIETY_MAP.keys()))
         soil_type = st.selectbox("Soil Type", list(SOIL_MAP.keys()))
         region    = st.selectbox("Region",    list(REGION_MAP.keys()))
-        area_ha   = st.number_input("Paddock Area (ha)", min_value=5.0, max_value=200.0,
-                                     value=35.0, step=0.5)
+        area_ha   = st.number_input(
+            "Paddock Area (ha)", min_value=5.0, max_value=200.0, value=35.0, step=0.5
+        )
         sow_date  = st.date_input(
             "Planned Sow Date",
             value=date(2025, 11, 15),
@@ -95,14 +243,15 @@ with left:
             max_value=date(2025, 12, 31),
         )
         season_year_fc = sow_date.year
-        default_wx = WEATHER.get((region, season_year_fc), {"rainfall_mm": 630, "avg_temp_c": 12.5})
-
-        rainfall  = st.slider("Seasonal Rainfall (mm)",  400, 900,
+        default_wx = WEATHER.get(
+            (region, season_year_fc), {"rainfall_mm": 630, "avg_temp_c": 12.5}
+        )
+        rainfall  = st.slider("Seasonal Rainfall (mm)", 400, 900,
                                value=int(default_wx["rainfall_mm"]), step=10)
-        avg_temp  = st.slider("Avg Growing Temp (°C)",   8.0, 18.0,
+        avg_temp  = st.slider("Avg Growing Temp (C)", 8.0, 18.0,
                                value=float(default_wx["avg_temp_c"]), step=0.1)
-        seed_rate = st.slider("Seed Rate (kg/ha)",        1.0, 2.0, value=1.5, step=0.05)
-        price_kg  = st.slider("Assumed Price ($/kg)",    50.0, 90.0, value=65.0, step=1.0)
+        seed_rate = st.slider("Seed Rate (kg/ha)", 1.0, 2.0, value=1.5, step=0.05)
+        price_kg  = st.slider("Assumed Price ($/kg)", 50.0, 90.0, value=65.0, step=1.0)
         submitted = st.form_submit_button("Run Forecast", type="primary")
 
 # ── Results ───────────────────────────────────────────────────────────────────
@@ -116,26 +265,25 @@ with right:
     if not (HIST_RANGES["rainfall_mm"][0] <= rainfall <= HIST_RANGES["rainfall_mm"][1]):
         warnings.append(
             f"Rainfall {rainfall} mm is outside the training range "
-            f"({HIST_RANGES['rainfall_mm'][0]}–{HIST_RANGES['rainfall_mm'][1]} mm). "
+            f"({HIST_RANGES['rainfall_mm'][0]}-{HIST_RANGES['rainfall_mm'][1]} mm). "
             "Extrapolated predictions may be less reliable."
         )
     if not (HIST_RANGES["avg_temp_c"][0] <= avg_temp <= HIST_RANGES["avg_temp_c"][1]):
         warnings.append(
-            f"Temperature {avg_temp} °C is outside the training range "
-            f"({HIST_RANGES['avg_temp_c'][0]}–{HIST_RANGES['avg_temp_c'][1]} °C)."
+            f"Temperature {avg_temp} C is outside the training range "
+            f"({HIST_RANGES['avg_temp_c'][0]}-{HIST_RANGES['avg_temp_c'][1]} C)."
         )
     if not (HIST_RANGES["seed_rate_kg_ha"][0] <= seed_rate <= HIST_RANGES["seed_rate_kg_ha"][1]):
         warnings.append(
             f"Seed rate {seed_rate} kg/ha is outside the training range "
-            f"({HIST_RANGES['seed_rate_kg_ha'][0]}–{HIST_RANGES['seed_rate_kg_ha'][1]} kg/ha)."
+            f"({HIST_RANGES['seed_rate_kg_ha'][0]}-{HIST_RANGES['seed_rate_kg_ha'][1]} kg/ha)."
         )
     for w in warnings:
         st.warning(w, icon="⚠️")
 
     # ── Base prediction ────────────────────────────────────────────────────────
-    X    = single_row(variety, soil_type, region, area_ha, sow_date,
-                      rainfall, avg_temp, seed_rate, season_year_fc)
-    pred = float(model.predict(X)[0])
+    pred  = predict_yield(variety, soil_type, region, area_ha, sow_date,
+                          rainfall, avg_temp, seed_rate, season_year_fc, model_data)
     ci_lo = max(8.0, pred - 1.645 * rmse)
     ci_hi = min(14.0, pred + 1.645 * rmse)
     rev   = pred * area_ha * price_kg
@@ -145,37 +293,27 @@ with right:
     cons_sow = sow_date + timedelta(days=14)
 
     scenarios = {
-        "Conservative": {
-            "rainfall": max(400, rainfall * 0.85),
-            "temp":     avg_temp + 1.0,
-            "seed":     1.2,
-            "sow":      cons_sow,
-        },
-        "Base": {
-            "rainfall": rainfall,
-            "temp":     avg_temp,
-            "seed":     seed_rate,
-            "sow":      sow_date,
-        },
-        "Optimistic": {
-            "rainfall": min(900, rainfall * 1.15),
-            "temp":     avg_temp,
-            "seed":     1.5,   # optimal seed rate for Tasmanian poppy
-            "sow":      opt_sow,
-        },
+        "Conservative": {"rainfall": max(400, rainfall * 0.85), "temp": avg_temp + 1.0,
+                         "seed": 1.2,      "sow": cons_sow},
+        "Base":         {"rainfall": rainfall,                   "temp": avg_temp,
+                         "seed": seed_rate, "sow": sow_date},
+        "Optimistic":   {"rainfall": min(900, rainfall * 1.15), "temp": avg_temp,
+                         "seed": 1.5,      "sow": opt_sow},
     }
 
-    sc_preds = {}
-    for sc_name, sc in scenarios.items():
-        Xs = single_row(variety, soil_type, region, area_ha, sc["sow"],
-                        sc["rainfall"], sc["temp"], sc["seed"], season_year_fc)
-        sc_preds[sc_name] = float(model.predict(Xs)[0])
+    sc_preds = {
+        sc_name: predict_yield(
+            variety, soil_type, region, area_ha, sc["sow"],
+            sc["rainfall"], sc["temp"], sc["seed"], season_year_fc, model_data,
+        )
+        for sc_name, sc in scenarios.items()
+    }
 
     # ── KPI metrics ───────────────────────────────────────────────────────────
     st.subheader("Forecast Result")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Predicted Yield (kg/ha)", f"{pred:.2f}")
-    m2.metric("90% CI (kg/ha)",          f"{ci_lo:.1f} – {ci_hi:.1f}")
+    m2.metric("90% CI (kg/ha)",          f"{ci_lo:.1f} - {ci_hi:.1f}")
     m3.metric("Est. Total Yield",        f"{pred * area_ha / 1000:.2f} t")
     m4.metric("Est. Revenue",            f"${rev:,.0f}")
 
@@ -185,7 +323,6 @@ with right:
     sign       = "above" if delta_pct >= 0 else "below"
     abs_pct    = abs(delta_pct)
 
-    # Use an HTML card; bare $...$ in Streamlit markdown is parsed as LaTeX
     st.markdown(
         f"<div style='background:#f0f7f4;border-left:4px solid #2d6a4f;"
         f"padding:14px 18px;border-radius:0 6px 6px 0;margin:14px 0;font-size:0.97rem'>"
@@ -195,7 +332,7 @@ with right:
         f"({abs_pct:.1f}% {sign} the industry benchmark of {hist_bench} kg/ha). "
         f"At ${price_kg:.0f}/kg the estimated revenue is <strong>${rev:,.0f}</strong>. "
         f"The 90% confidence interval is <strong>{ci_lo:.1f} to {ci_hi:.1f} kg/ha</strong> "
-        f"(&plusmn;{1.645 * rmse:.2f} kg/ha, based on model validation RMSE)."
+        f"(&plusmn;{1.645 * rmse:.2f} kg/ha, based on model RMSE)."
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -213,8 +350,10 @@ with right:
                 grower = sess.get(Grower, pad.grower_id) if pad else None
                 c      = sess.get(Contract, h.contract_id)
                 if c and grower and c.variety == variety and grower.region == region and h.yield_kg_ha:
-                    all_soils.append({"season": c.season, "yield_kg_ha": h.yield_kg_ha,
-                                      "soil_type": pad.soil_type})
+                    all_soils.append({
+                        "season": c.season, "yield_kg_ha": h.yield_kg_ha,
+                        "soil_type": pad.soil_type,
+                    })
                     if pad.soil_type == soil_type:
                         matched.append({"season": c.season, "yield_kg_ha": h.yield_kg_ha})
             return pd.DataFrame(matched), pd.DataFrame(all_soils)
@@ -252,24 +391,28 @@ with right:
         fig.add_trace(go.Scatter(
             x=["Forecast"], y=[pred], mode="markers",
             marker=dict(color="#1565c0", size=14, symbol="diamond"),
-            error_y=dict(type="data", symmetric=False,
-                         array=[ci_hi - pred], arrayminus=[pred - ci_lo],
-                         color="#1565c0", thickness=2.5, width=10),
+            error_y=dict(
+                type="data", symmetric=False,
+                array=[ci_hi - pred], arrayminus=[pred - ci_lo],
+                color="#1565c0", thickness=2.5, width=10,
+            ),
             name="Forecast (base)",
         ))
-        fig.add_hline(y=avg_val, line_dash="dash", line_color="#f57f17",
-                      annotation_text=bench_lbl, annotation_position="top left")
+        fig.add_hline(
+            y=avg_val, line_dash="dash", line_color="#f57f17",
+            annotation_text=bench_lbl, annotation_position="top left",
+        )
         all_vals = list(box_src["yield_kg_ha"]) if not box_src.empty else [pred]
-        y_min = max(0, min(min(all_vals), ci_lo) - 1)
-        y_max = max(max(all_vals), ci_hi) + 1
         fig.update_layout(
-            yaxis=dict(title="Yield (kg/ha)", range=[y_min, y_max]),
+            yaxis=dict(title="Yield (kg/ha)",
+                       range=[max(0, min(min(all_vals), ci_lo) - 1),
+                              max(max(all_vals), ci_hi) + 1]),
             height=360, margin=dict(l=0, r=0, t=10, b=0),
         )
         st.plotly_chart(fig, width="stretch")
         st.caption(
-            "Box plots = historical yield distribution for the same variety and region. "
-            "Diamond = base forecast. Error bars = 90% confidence interval."
+            "Box plots: historical yield distribution for the same variety and region. "
+            "Diamond: base forecast. Error bars: 90% confidence interval."
         )
 
     with col_sc:
@@ -279,8 +422,7 @@ with right:
             for k, v in sc_preds.items()
         ])
         fig_sc = px.bar(
-            sc_df, x="Scenario", y="Yield (kg/ha)",
-            color="Scenario",
+            sc_df, x="Scenario", y="Yield (kg/ha)", color="Scenario",
             color_discrete_map={
                 "Conservative": "#c62828",
                 "Base":          "#2d6a4f",
@@ -293,26 +435,30 @@ with right:
                          annotation_text="Benchmark")
         fig_sc.update_layout(
             height=360, margin=dict(l=0, r=0, t=10, b=0),
-            yaxis=dict(title="Yield (kg/ha)", range=[8, max(sc_preds.values()) + 1.5]),
+            yaxis=dict(title="Yield (kg/ha)",
+                       range=[8, max(sc_preds.values()) + 1.5]),
             showlegend=False,
         )
         st.plotly_chart(fig_sc, width="stretch")
-        for _, r in sc_df.iterrows():
+        for _, row in sc_df.iterrows():
             st.markdown(
-                f"**{r['Scenario']}:** {r['Yield (kg/ha)']:.2f} kg/ha "
-                f"→ ${r['Revenue']:,.0f}"
+                f"**{row['Scenario']}:** {row['Yield (kg/ha)']:.2f} kg/ha "
+                f"-> ${row['Revenue']:,.0f}"
             )
         st.caption(
             "Optimistic: +15% rainfall, optimal seed rate. "
-            "Conservative: −15% rainfall, 1.2 kg/ha seed rate."
+            "Conservative: -15% rainfall, 1.2 kg/ha seed rate."
         )
 
-    # ── Feature driver chart ───────────────────────────────────────────────────
+    # ── Feature importance chart ───────────────────────────────────────────────
     if feat_imp:
         st.divider()
         st.subheader("Forecast Drivers (Permutation Feature Importance)")
         imp_df = (
-            pd.DataFrame({"feature": list(feat_imp.keys()), "importance": list(feat_imp.values())})
+            pd.DataFrame({
+                "feature":    list(feat_imp.keys()),
+                "importance": list(feat_imp.values()),
+            })
             .replace({"feature": FEAT_LABELS})
             .sort_values("importance")
         )
@@ -335,11 +481,16 @@ with right:
 
     # ── Export ────────────────────────────────────────────────────────────────
     st.divider()
+    val_r2_export = (
+        f"{model_data['val_r2']:.3f}"
+        if model_data and model_data.get("val_r2") is not None
+        else "N/A"
+    )
     export_rows = [
         ["Parameter", "Value"],
         ["Variety", variety], ["Soil Type", soil_type], ["Region", region],
         ["Area (ha)", area_ha], ["Sow Date", str(sow_date)],
-        ["Rainfall (mm)", rainfall], ["Avg Temp (°C)", avg_temp],
+        ["Rainfall (mm)", rainfall], ["Avg Temp (C)", avg_temp],
         ["Seed Rate (kg/ha)", seed_rate], ["Season Year", season_year_fc],
         [],
         ["Scenario", "Yield (kg/ha)", "Revenue (AUD)"],
@@ -351,14 +502,13 @@ with right:
         ["90% CI Low (kg/ha)", f"{ci_lo:.2f}"],
         ["90% CI High (kg/ha)", f"{ci_hi:.2f}"],
         ["Model RMSE (kg/ha)", f"{rmse:.3f}"],
-        ["Model Val R²", f"{model_data.get('val_r2', 'N/A')}"],
+        ["Model Val R2", val_r2_export],
     ]
 
     buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerows(export_rows)
+    csv.writer(buf).writerows(export_rows)
     st.download_button(
-        "📥 Export Forecast (CSV)",
+        "Export Forecast (CSV)",
         data=buf.getvalue().encode(),
         file_name=f"forecast_{variety}_{region}_{season_year_fc}.csv",
         mime="text/csv",
